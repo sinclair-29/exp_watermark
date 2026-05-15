@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+
+import argparse
+import gc
+import json
+import os
+import subprocess
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
+
+
+MODEL_PATHS = {
+    "Phi-3-mini": "../LLMJailbreak/models/Phi-3-mini-128k-instruct",
+    "Qwen2.5-7B": "../LLMJailbreak/models/Qwen2.5-7B-Instruct",
+    "Llama-2-7B": "../LLMJailbreak/models/Llama-2-7b-chat-hf",
+}
+
+METHOD_KEYS = (
+    "none",
+    "kgw",
+    "opt",
+    "morph_linear",
+    "morph_exp",
+    "morph_log",
+)
+
+RESULTS_DIR = Path("results/baseline")
+RAW_DIR = RESULTS_DIR / "raw"
+SUMMARY_CSV = RESULTS_DIR / "summary.csv"
+SUMMARY_MD = RESULTS_DIR / "summary.md"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run baseline watermark experiments with one loaded model at a time.")
+    parser.add_argument("prompt_file", nargs="?", default="data/prompts.txt", help="Prompt file path")
+    parser.add_argument("begin_index", nargs="?", type=int, default=1, help="1-based inclusive prompt start index")
+    parser.add_argument("end_index", nargs="?", type=int, default=None, help="1-based inclusive prompt end index")
+    parser.add_argument("--models", type=str, default=",".join(MODEL_PATHS.keys()), help="Comma-separated model names")
+    parser.add_argument("--methods", type=str, default=",".join(METHOD_KEYS), help="Comma-separated method keys")
+    parser.add_argument("--max_new_tokens", type=int, default=50)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=0)
+    parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--no_sample", action="store_true", help="Disable sampling")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing raw JSON files")
+    return parser
+
+
+def parse_csv_arg(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def validate_args(args: argparse.Namespace) -> Tuple[Path, List[str], List[str], bool]:
+    prompt_file = Path(args.prompt_file)
+    if not prompt_file.is_file():
+        raise SystemExit(f"Error: prompt file not found: {prompt_file}")
+
+    if args.begin_index < 1:
+        raise SystemExit(f"Error: begin_index must be >= 1, got {args.begin_index}")
+
+    if args.end_index is not None and args.end_index < args.begin_index:
+        raise SystemExit(
+            f"Error: end_index ({args.end_index}) must be >= begin_index ({args.begin_index})"
+        )
+
+    selected_models = parse_csv_arg(args.models)
+    if not selected_models:
+        raise SystemExit("Error: --models must specify at least one model name")
+    unsupported_models = [model for model in selected_models if model not in MODEL_PATHS]
+    if unsupported_models:
+        raise SystemExit(f"Error: unsupported model name(s): {', '.join(unsupported_models)}")
+
+    selected_methods = parse_csv_arg(args.methods)
+    if not selected_methods:
+        raise SystemExit("Error: --methods must specify at least one method key")
+    unsupported_methods = [method for method in selected_methods if method not in METHOD_KEYS]
+    if unsupported_methods:
+        raise SystemExit(f"Error: unsupported method key(s): {', '.join(unsupported_methods)}")
+
+    for model_name in selected_models:
+        model_path = Path(MODEL_PATHS[model_name])
+        if not model_path.is_dir():
+            raise SystemExit(f"Error: model directory not found for {model_name}: {model_path}")
+
+    force = args.force or os.environ.get("FORCE") == "1"
+    return prompt_file, selected_models, selected_methods, force
+
+
+def load_selected_prompts(prompt_file: Path, begin_index: int, end_index: int | None) -> List[Tuple[int, str, str]]:
+    selected: List[Tuple[int, str, str]] = []
+    prompt_index = 0
+
+    with prompt_file.open() as handle:
+        for line in handle:
+            prompt = line.strip()
+            if not prompt:
+                continue
+
+            prompt_index += 1
+            if prompt_index < begin_index:
+                continue
+            if end_index is not None and prompt_index > end_index:
+                break
+
+            prompt_id = f"prompt_{prompt_index:04d}"
+            selected.append((prompt_index, prompt_id, prompt))
+
+    if prompt_index == 0:
+        raise SystemExit(f"Error: no non-empty prompts found in {prompt_file}")
+
+    if not selected:
+        if end_index is not None:
+            raise SystemExit(
+                f"Error: selected prompt range [{begin_index}, {end_index}] contains no non-empty prompts."
+            )
+        raise SystemExit(
+            f"Error: selected prompt range starting at {begin_index} contains no non-empty prompts."
+        )
+
+    return selected
+
+
+def build_config(method_key: str):
+    from llm_watermarking.config import WatermarkConfig
+
+    if method_key == "none":
+        return WatermarkConfig(watermark_type="none")
+    if method_key == "kgw":
+        return WatermarkConfig(watermark_type="kgw", gamma=0.5, delta=2.0)
+    if method_key == "opt":
+        return WatermarkConfig(watermark_type="opt", gamma=0.5, beta=0.0)
+    if method_key == "morph_linear":
+        return WatermarkConfig(watermark_type="morph", morph_variant="linear")
+    if method_key == "morph_exp":
+        return WatermarkConfig(watermark_type="morph", morph_variant="exp")
+    if method_key == "morph_log":
+        return WatermarkConfig(watermark_type="morph", morph_variant="log")
+    raise ValueError(f"Unsupported method key: {method_key}")
+
+
+def to_jsonable(value):
+    if isinstance(value, dict):
+        return {key: to_jsonable(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [to_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [to_jsonable(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            return str(value)
+    return value
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(to_jsonable(payload), indent=2, sort_keys=True))
+
+
+def get_model_device(model):
+    device = getattr(model, "device", None)
+    if device is not None:
+        return device
+
+    parameters = getattr(model, "parameters", None)
+    if callable(parameters):
+        try:
+            return next(parameters()).device
+        except StopIteration:
+            return None
+    return None
+
+
+def run_for_model(
+    model_name: str,
+    model_path: str,
+    prompts: Sequence[Tuple[int, str, str]],
+    selected_methods: Sequence[str],
+    args: argparse.Namespace,
+    force: bool,
+) -> None:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from llm_watermarking.analysis import compute_completion_logppl_and_ppl
+    from llm_watermarking.detection import WatermarkDetector
+    from llm_watermarking.generation import generate_with_watermark
+
+    print(f"Loading model: {model_name} from {model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+    model.eval()
+
+    if getattr(tokenizer, "pad_token_id", None) is None and getattr(tokenizer, "eos_token_id", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    try:
+        for _, prompt_id, prompt in prompts:
+            print(f"Prompt {prompt_id}")
+            for method_key in selected_methods:
+                output_json = RAW_DIR / model_name / method_key / f"{prompt_id}.json"
+                if not force and output_json.exists() and output_json.stat().st_size > 0:
+                    print(f"Skipping existing result: {output_json}")
+                    continue
+
+                print(f"  Method {method_key} -> {output_json}")
+                config = build_config(method_key)
+                generation_result = generate_with_watermark(
+                    model,
+                    tokenizer,
+                    prompt,
+                    max_new_tokens=args.max_new_tokens,
+                    config=config,
+                    hard=False,
+                    do_sample=not args.no_sample,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
+                    num_beams=args.num_beams,
+                )
+
+                detector = WatermarkDetector(tokenizer, config)
+                detection_result = detector.detect_tokens(
+                    generation_result["full_ids"],
+                    prompt_len=generation_result["prompt_len"],
+                    ignore_repeated_ngrams=False,
+                )
+
+                model_device = get_model_device(model)
+                input_ids = torch.tensor(
+                    [generation_result["full_ids"]],
+                    dtype=torch.long,
+                    device=model_device,
+                )
+                attention_mask = torch.ones_like(input_ids)
+                ppl_result = compute_completion_logppl_and_ppl(
+                    model,
+                    input_ids,
+                    prompt_len=generation_result["prompt_len"],
+                    attention_mask=attention_mask,
+                )
+
+                payload = {
+                    "prompt": prompt,
+                    "prompt_id": prompt_id,
+                    "model_name": model_name,
+                    "model_path": model_path,
+                    "method_key": method_key,
+                    "config": vars(config),
+                    "generation": generation_result,
+                    "detection": detection_result,
+                    "ppl": ppl_result,
+                }
+                write_json(output_json, payload)
+    finally:
+        del model
+        del tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def run_summary(selected_models: Sequence[str], selected_methods: Sequence[str]) -> None:
+    command = [
+        "python",
+        "scripts/summarize_baseline_results.py",
+        "--raw_dir",
+        str(RAW_DIR),
+        "--summary_csv",
+        str(SUMMARY_CSV),
+        "--summary_md",
+        str(SUMMARY_MD),
+        "--models",
+        ",".join(selected_models),
+        "--methods",
+        ",".join(selected_methods),
+    ]
+    subprocess.run(command, check=True)
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    prompt_file, selected_models, selected_methods, force = validate_args(args)
+
+    prompts = load_selected_prompts(prompt_file, args.begin_index, args.end_index)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+    range_label = (
+        f"[{args.begin_index}, {args.end_index}]"
+        if args.end_index is not None
+        else f"[{args.begin_index}, end]"
+    )
+    print(f"Selected prompt range: {range_label}")
+    print(f"Selected models: {', '.join(selected_models)}")
+    print(f"Selected methods: {', '.join(selected_methods)}")
+    print(f"Selected non-empty prompts: {len(prompts)}")
+
+    for model_name in selected_models:
+        run_for_model(
+            model_name=model_name,
+            model_path=MODEL_PATHS[model_name],
+            prompts=prompts,
+            selected_methods=selected_methods,
+            args=args,
+            force=force,
+        )
+
+    run_summary(selected_models, selected_methods)
+
+
+if __name__ == "__main__":
+    main()

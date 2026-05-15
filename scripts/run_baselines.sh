@@ -3,4 +3,4 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "$SCRIPT_DIR/run_baseline.sh" "$@"
+exec python "$SCRIPT_DIR/run_baseline_batch.py" "$@"

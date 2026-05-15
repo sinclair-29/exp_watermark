@@ -55,6 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw_dir", required=True, help="Directory containing raw JSON outputs.")
     parser.add_argument("--summary_csv", required=True, help="Path to write the CSV summary.")
     parser.add_argument("--summary_md", required=True, help="Path to write the Markdown summary.")
+    parser.add_argument("--models", type=str, default=None, help="Optional comma-separated model names to include.")
+    parser.add_argument("--methods", type=str, default=None, help="Optional comma-separated method keys to include.")
     return parser
 
 
@@ -68,12 +70,27 @@ def std_or_nan(values: List[float]) -> float:
     return statistics.pstdev(values)
 
 
-def scan_raw_results(raw_dir: Path) -> Dict[Tuple[str, str], Dict[str, List[float]]]:
+def parse_csv_arg(value: str | None) -> List[str] | None:
+    if value is None:
+        return None
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or None
+
+
+def scan_raw_results(
+    raw_dir: Path,
+    selected_models: set[str] | None = None,
+    selected_methods: set[str] | None = None,
+) -> Dict[Tuple[str, str], Dict[str, List[float]]]:
     grouped: Dict[Tuple[str, str], Dict[str, List[float]]] = defaultdict(lambda: {"z_scores": [], "ppls": []})
 
     for path in sorted(raw_dir.glob("*/*/*.json")):
         model_name = path.parts[-3]
         method_key = path.parts[-2]
+        if selected_models is not None and model_name not in selected_models:
+            continue
+        if selected_methods is not None and method_key not in selected_methods:
+            continue
 
         with path.open() as handle:
             payload = json.load(handle)
@@ -89,9 +106,18 @@ def scan_raw_results(raw_dir: Path) -> Dict[Tuple[str, str], Dict[str, List[floa
     return grouped
 
 
-def build_rows(grouped: Dict[Tuple[str, str], Dict[str, List[float]]]) -> List[Dict[str, object]]:
+def build_rows(
+    grouped: Dict[Tuple[str, str], Dict[str, List[float]]],
+    selected_models: set[str] | None = None,
+    selected_methods: set[str] | None = None,
+) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     for model_name, method_key in DISPLAY_ORDER:
+        if selected_models is not None and model_name not in selected_models:
+            continue
+        if selected_methods is not None and method_key not in selected_methods:
+            continue
+
         stats = grouped.get((model_name, method_key), {"z_scores": [], "ppls": []})
         z_scores = stats["z_scores"]
         ppls = stats["ppls"]
@@ -169,9 +195,13 @@ def main() -> None:
     raw_dir = Path(args.raw_dir)
     summary_csv = Path(args.summary_csv)
     summary_md = Path(args.summary_md)
+    selected_models = parse_csv_arg(args.models)
+    selected_methods = parse_csv_arg(args.methods)
+    selected_model_set = set(selected_models) if selected_models is not None else None
+    selected_method_set = set(selected_methods) if selected_methods is not None else None
 
-    grouped = scan_raw_results(raw_dir)
-    rows = build_rows(grouped)
+    grouped = scan_raw_results(raw_dir, selected_model_set, selected_method_set)
+    rows = build_rows(grouped, selected_model_set, selected_method_set)
 
     write_csv(rows, summary_csv)
     write_markdown(rows, summary_md)
