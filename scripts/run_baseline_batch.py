@@ -5,14 +5,22 @@ import gc
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+
 MODEL_PATHS = {
-    "Phi-3-mini": "../LLMJailbreak/models/Phi-3-mini-128k-instruct",
-    "Qwen2.5-7B": "../LLMJailbreak/models/Qwen2.5-7B-Instruct",
-    "Llama-2-7B": "../LLMJailbreak/models/Llama-2-7b-chat-hf",
+    "Phi-3-mini": str((ROOT_DIR / "../LLMJailbreak/models/Phi-3-mini-128k-instruct").resolve()),
+    "Qwen2.5-7B": str((ROOT_DIR / "../LLMJailbreak/models/Qwen2.5-7B-Instruct").resolve()),
+    "Llama-2-7B": str((ROOT_DIR / "../LLMJailbreak/models/Llama-2-7b-chat-hf").resolve()),
 }
 
 METHOD_KEYS = (
@@ -24,7 +32,7 @@ METHOD_KEYS = (
     "morph_log",
 )
 
-RESULTS_DIR = Path("results/baseline")
+RESULTS_DIR = ROOT_DIR / "results" / "baseline"
 RAW_DIR = RESULTS_DIR / "raw"
 SUMMARY_CSV = RESULTS_DIR / "summary.csv"
 SUMMARY_MD = RESULTS_DIR / "summary.md"
@@ -52,7 +60,11 @@ def parse_csv_arg(value: str) -> List[str]:
 
 
 def validate_args(args: argparse.Namespace) -> Tuple[Path, List[str], List[str], bool]:
-    prompt_file = Path(args.prompt_file)
+    prompt_file = Path(args.prompt_file).expanduser()
+    if not prompt_file.is_absolute():
+        prompt_file = (Path.cwd() / prompt_file).resolve()
+    else:
+        prompt_file = prompt_file.resolve()
     if not prompt_file.is_file():
         raise SystemExit(f"Error: prompt file not found: {prompt_file}")
 
@@ -268,8 +280,8 @@ def run_for_model(
 
 def run_summary(selected_models: Sequence[str], selected_methods: Sequence[str]) -> None:
     command = [
-        "python",
-        "scripts/summarize_baseline_results.py",
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "summarize_baseline_results.py"),
         "--raw_dir",
         str(RAW_DIR),
         "--summary_csv",
