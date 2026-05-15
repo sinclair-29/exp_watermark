@@ -37,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("end_index", nargs="?", type=int, default=None, help="1-based inclusive prompt end index")
     parser.add_argument("--models", type=str, default=",".join(MODEL_PATHS.keys()), help="Comma-separated model names")
     parser.add_argument("--methods", type=str, default=",".join(METHOD_KEYS), help="Comma-separated method keys")
-    parser.add_argument("--max_new_tokens", type=int, default=50)
+    parser.add_argument("--max_new_tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
