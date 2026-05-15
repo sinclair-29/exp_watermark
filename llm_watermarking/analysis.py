@@ -1,4 +1,5 @@
-from typing import Dict, Tuple
+import math
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -44,14 +45,107 @@ def compute_theoretical_bounds(
 
 def compute_perplexity_bound(config: WatermarkConfig) -> float:
     """
-    Compute perplexity upper bound (Paper Theorem 4.3).
+    Theoretical KGW perplexity upper-bound factor from the paper.
 
-    E[perplexity] <= (1 + (alpha-1)*gamma) * P*
-
-    where P* is the perplexity of the original model.
+    This is not actual perplexity and should be reported separately from real PPL.
     """
     alpha = np.exp(config.delta)
     return 1 + (alpha - 1) * config.gamma
+
+
+def compute_completion_logppl_and_ppl(
+    model,
+    input_ids,
+    prompt_len: int,
+    attention_mask: Optional[object] = None,
+) -> Dict:
+    """
+    Compute real completion-only log-PPL / PPL.
+
+    ``labels[:, :prompt_len] = -100`` is correct for Hugging Face causal LMs
+    because the implementation shifts labels internally. The first generated token
+    at position ``prompt_len`` is therefore predicted from the previous prompt
+    token and still counted, while the prompt tokens themselves are excluded.
+    """
+    import torch
+
+    if input_ids.ndim == 1:
+        input_ids = input_ids.unsqueeze(0)
+    if attention_mask is not None and attention_mask.ndim == 1:
+        attention_mask = attention_mask.unsqueeze(0)
+
+    prompt_len = max(0, min(int(prompt_len), input_ids.size(1)))
+    labels = input_ids.clone()
+    labels[:, :prompt_len] = -100
+
+    # HF causal LMs shift labels internally, so labels[:, 1:] is the set of
+    # targets that actually contribute to the loss.
+    num_scored_tokens = int((labels[:, 1:] != -100).sum().item())
+    if num_scored_tokens == 0:
+        return {
+            "log_ppl": float("nan"),
+            "mean_nll": float("nan"),
+            "ppl": float("inf"),
+            "num_scored_tokens": 0,
+            "total_nll": 0.0,
+        }
+
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+    mean_nll = float(outputs.loss.detach().cpu().item())
+    try:
+        ppl = math.exp(mean_nll)
+    except OverflowError:
+        ppl = float("inf")
+
+    return {
+        "log_ppl": mean_nll,
+        "mean_nll": mean_nll,
+        "ppl": ppl,
+        "num_scored_tokens": num_scored_tokens,
+        "total_nll": mean_nll * num_scored_tokens,
+    }
+
+
+def compute_completion_ppl_from_text(
+    model,
+    tokenizer,
+    prompt: str,
+    completion: str,
+) -> Dict:
+    """
+    Convenience helper for text inputs.
+
+    The main CLI uses generated token ids directly and should prefer
+    ``compute_completion_logppl_and_ppl`` to avoid decode+retokenize mismatch.
+    """
+    import torch
+
+    device = getattr(model, "device", None)
+    prompt_batch = tokenizer(prompt, return_tensors="pt")
+    completion_batch = tokenizer(completion, return_tensors="pt", add_special_tokens=False)
+
+    prompt_ids = prompt_batch.input_ids
+    completion_ids = completion_batch.input_ids
+    full_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+
+    attention_mask = getattr(prompt_batch, "attention_mask", None)
+    completion_attention_mask = getattr(completion_batch, "attention_mask", None)
+    if attention_mask is not None and completion_attention_mask is not None:
+        attention_mask = torch.cat([attention_mask, completion_attention_mask], dim=1)
+
+    if device is not None:
+        full_ids = full_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+    return compute_completion_logppl_and_ppl(
+        model,
+        full_ids,
+        prompt_len=prompt_ids.size(1),
+        attention_mask=attention_mask,
+    )
 
 
 def simulate_attack(

@@ -4,12 +4,21 @@ from typing import List, Optional
 
 @dataclass
 class WatermarkConfig:
-    """Watermark configuration parameters."""
+    """Watermark configuration parameters.
 
+    Notes:
+    - ``seeding_scheme="simple"`` means the green/red list for the next token is
+      seeded from the previous ``hash_window`` tokens.
+    - Detection must use the same seeding settings as generation or the recovered
+      green/red lists will not match.
+    - ``hash_window=1`` is the closest simple baseline to paper-style KGW / OPT /
+      MorphMark experiments in this repository.
+    """
+
+    watermark_type: str = "kgw"
     gamma: float = 0.5
     delta: float = 2.0
     beta: float = 0.0
-    watermark_type: str = "kgw"
     hash_window: int = 1
     seeding_scheme: str = "simple"
     private_key: Optional[str] = None

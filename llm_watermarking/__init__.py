@@ -1,4 +1,10 @@
-from llm_watermarking.analysis import compute_perplexity_bound, compute_theoretical_bounds, simulate_attack
+from llm_watermarking.analysis import (
+    compute_completion_logppl_and_ppl,
+    compute_completion_ppl_from_text,
+    compute_perplexity_bound,
+    compute_theoretical_bounds,
+    simulate_attack,
+)
 from llm_watermarking.cli import main
 from llm_watermarking.config import WatermarkConfig
 from llm_watermarking.detection import WatermarkDetector
@@ -14,6 +20,8 @@ __all__ = [
     "generate_with_watermark",
     "compute_theoretical_bounds",
     "compute_perplexity_bound",
+    "compute_completion_logppl_and_ppl",
+    "compute_completion_ppl_from_text",
     "simulate_attack",
     "main",
 ]

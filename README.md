@@ -2,6 +2,10 @@
 
 This repository is a research artifact for KGW, OPT, and MorphMark watermarking experiments on causal language models.
 
+The implementation is paper-faithful and internally deterministic, but it does not
+claim bit-level parity with the official KGW repository's PRF unless that is
+separately tested.
+
 The codebase is intentionally small and paper-friendly:
 - `config.py` for experiment parameters
 - `watermarking.py` for watermark construction and processors

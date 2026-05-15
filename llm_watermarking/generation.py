@@ -1,61 +1,83 @@
-from typing import Dict, Optional, Tuple
-
-import numpy as np
+from typing import Any, Dict, Optional
 
 from llm_watermarking.config import WatermarkConfig
-from llm_watermarking.watermarking import (
-    PrivateWatermarkLogitsProcessor,
-    WatermarkLogitsProcessor,
-    compute_spike_entropy,
-)
+from llm_watermarking.watermarking import WatermarkLogitsProcessor
+
+try:
+    from transformers import LogitsProcessorList
+except ImportError:  # pragma: no cover - exercised only in envs without transformers.
+    class LogitsProcessorList(list):  # type: ignore[override]
+        """Fallback list implementation so the package can import without transformers."""
+
+        def __call__(self, input_ids, scores):
+            for processor in self:
+                scores = processor(input_ids, scores)
+            return scores
+
+
+def _get_model_device(model):
+    device = getattr(model, "device", None)
+    if device is not None:
+        return device
+
+    parameters = getattr(model, "parameters", None)
+    if callable(parameters):
+        try:
+            return next(parameters()).device
+        except StopIteration:
+            return None
+    return None
+
+
+def _get_batch_value(batch, key: str, default=None):
+    if isinstance(batch, dict):
+        return batch.get(key, default)
+    return getattr(batch, key, default)
+
+
+def _maybe_to_device(tensor, device):
+    if tensor is None or device is None or not hasattr(tensor, "to"):
+        return tensor
+    return tensor.to(device)
+
+
+def _tensor_to_list(tokens):
+    if hasattr(tokens, "detach"):
+        tokens = tokens.detach()
+    if hasattr(tokens, "cpu"):
+        tokens = tokens.cpu()
+    if hasattr(tokens, "tolist"):
+        return tokens.tolist()
+    return list(tokens)
 
 
 class WatermarkBeamSearcher:
+    """
+    Thin compatibility wrapper over the main HF generation path.
+
+    The repository now uses ``model.generate(...)`` for the real implementation.
+    This class remains for compatibility with older imports and simply runs the
+    same generation path with beam search settings.
+    """
+
     def __init__(self, model, tokenizer, config: WatermarkConfig, num_beams: int = 4):
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
         self.num_beams = num_beams
-        self.watermark_processor = WatermarkLogitsProcessor(config, tokenizer.vocab_size)
 
     def generate(self, prompt: str, max_new_tokens: int = 50, hard: bool = False) -> str:
-        """
-        Generate watermarked text using Beam Search.
-        """
-        import torch
-
-        device = self.model.device
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-
-        beams = [(0.0, input_ids[0].tolist())]
-
-        for _ in range(max_new_tokens):
-            all_candidates = []
-
-            for score, tokens in beams:
-                input_tensor = torch.tensor([tokens], device=device)
-
-                with torch.no_grad():
-                    outputs = self.model(input_tensor)
-                    logits = outputs.logits[:, -1, :].squeeze(0)
-
-                logits = self.watermark_processor(logits, tokens, hard=hard)
-                log_probs = torch.log_softmax(logits, dim=-1)
-                top_log_probs, top_indices = torch.topk(log_probs, self.num_beams)
-
-                for log_prob, token_id in zip(top_log_probs, top_indices):
-                    new_tokens = tokens + [token_id.item()]
-                    new_score = score + log_prob.item()
-                    all_candidates.append((new_score, new_tokens))
-
-            all_candidates.sort(key=lambda item: item[0], reverse=True)
-            beams = all_candidates[: self.num_beams]
-
-            if all(self.tokenizer.eos_token_id in tokens for _, tokens in beams):
-                break
-
-        best_tokens = beams[0][1]
-        return self.tokenizer.decode(best_tokens, skip_special_tokens=True)
+        result = generate_with_watermark(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            config=self.config,
+            hard=hard,
+            do_sample=False,
+            num_beams=self.num_beams,
+        )
+        return result["full_text"]
 
 
 def generate_with_watermark(
@@ -65,103 +87,94 @@ def generate_with_watermark(
     max_new_tokens: int = 50,
     config: Optional[WatermarkConfig] = None,
     hard: bool = False,
-    use_beam_search: bool = False,
-    num_beams: int = 4,
-) -> Tuple[str, Dict]:
-    import torch
+    do_sample: bool = True,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    num_beams: int = 1,
+) -> Dict[str, Any]:
+    """
+    Generate a completion and return prompt/completion tokenization explicitly.
 
+    The returned ids are decoded without re-tokenizing text so detection and PPL
+    can operate on the exact generated token sequence.
+    """
     if config is None:
         config = WatermarkConfig()
 
-    if use_beam_search:
-        searcher = WatermarkBeamSearcher(model, tokenizer, config, num_beams)
-        text = searcher.generate(prompt, max_new_tokens, hard)
-        return text, {"method": "beam_search", "num_beams": num_beams}
+    device = _get_model_device(model)
+    encoded = tokenizer(prompt, return_tensors="pt")
+    input_ids = _maybe_to_device(_get_batch_value(encoded, "input_ids"), device)
+    attention_mask = _maybe_to_device(_get_batch_value(encoded, "attention_mask"), device)
 
-    device = model.device
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    generated = input_ids.clone()
+    prompt_ids = _tensor_to_list(input_ids[0])
+    prompt_len = len(prompt_ids)
 
-    if config.seeding_scheme == "private":
-        processor = PrivateWatermarkLogitsProcessor(config, tokenizer.vocab_size)
-    else:
-        processor = WatermarkLogitsProcessor(config, tokenizer.vocab_size)
+    logits_processor = None
+    watermark_processor = None
+    if config.watermark_type.lower() != "none":
+        model_config = getattr(model, "config", None)
+        model_vocab_size = getattr(model_config, "vocab_size", None)
+        if model_vocab_size is None:
+            model_vocab_size = getattr(model, "vocab_size", None)
+        if model_vocab_size is None:
+            model_vocab_size = tokenizer.vocab_size
+        watermark_processor = WatermarkLogitsProcessor(config, int(model_vocab_size), hard=hard)
+        logits_processor = LogitsProcessorList([watermark_processor])
 
-    spike_entropies = []
-    opt_B_values = []
-    opt_applied_count = 0
-
-    morph_PG_values = []
-    morph_r_values = []
-    morph_applied_count = 0
-
-    for _ in range(max_new_tokens):
-        with torch.no_grad():
-            outputs = model(generated)
-            logits = outputs.logits[:, -1, :].squeeze(0)
-
-        prev_tokens = generated[0].tolist()
-
-        probs = torch.softmax(logits, dim=-1)
-        z_mod = (1 - config.gamma) * (np.exp(config.delta) - 1) / (
-            1 + (np.exp(config.delta) - 1) * config.gamma
-        )
-        spike_entropy = compute_spike_entropy(probs, z_mod)
-        spike_entropies.append(spike_entropy)
-
-        if config.seeding_scheme == "private":
-            logits, forced_token = processor(logits, prev_tokens, hard)
-            if forced_token is not None:
-                next_token = torch.tensor([[forced_token]], device=device)
-            else:
-                probs = torch.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).unsqueeze(0)
-        else:
-            logits, wm_info = processor(logits, prev_tokens, hard, return_info=True)
-            mode = wm_info.get("mode")
-            if mode == "opt":
-                opt_B_values.append(wm_info.get("B"))
-                opt_applied_count += int(wm_info.get("applied", False))
-            elif mode == "morph":
-                morph_PG_values.append(wm_info.get("P_G"))
-                morph_r_values.append(wm_info.get("r"))
-                morph_applied_count += int(wm_info.get("applied", False))
-
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).unsqueeze(0)
-
-        generated = torch.cat([generated, next_token], dim=1)
-
-        if next_token.item() == tokenizer.eos_token_id:
-            break
-
-    text = tokenizer.decode(generated[0].cpu(), skip_special_tokens=True)
-
-    metadata = {
-        "method": "multinomial",
-        "watermark_type": config.watermark_type,
-        "avg_spike_entropy": np.mean(spike_entropies) if spike_entropies else 0,
-        "num_tokens_generated": len(spike_entropies),
+    generate_kwargs: Dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "num_beams": num_beams,
     }
-    if config.watermark_type.lower() == "opt":
-        metadata.update(
-            {
-                "beta": config.beta,
-                "avg_opt_B": float(np.mean(opt_B_values)) if opt_B_values else None,
-                "opt_applied_tokens": opt_applied_count,
-                "opt_applied_fraction": opt_applied_count / max(1, len(opt_B_values)),
-            }
-        )
-    elif config.watermark_type.lower() == "morph":
-        metadata.update(
-            {
-                "morph_variant": config.morph_variant,
-                "morph_p0": config.morph_p0,
-                "avg_morph_P_G": float(np.mean(morph_PG_values)) if morph_PG_values else None,
-                "avg_morph_r": float(np.mean(morph_r_values)) if morph_r_values else None,
-                "morph_applied_tokens": morph_applied_count,
-                "morph_applied_fraction": morph_applied_count / max(1, len(morph_r_values)),
-            }
-        )
+    if attention_mask is not None:
+        generate_kwargs["attention_mask"] = attention_mask
+    if logits_processor is not None:
+        generate_kwargs["logits_processor"] = logits_processor
 
-    return text, metadata
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        generate_kwargs["eos_token_id"] = eos_token_id
+        if getattr(tokenizer, "pad_token_id", None) is None:
+            generate_kwargs["pad_token_id"] = eos_token_id
+
+    output_ids = model.generate(input_ids=input_ids, **generate_kwargs)
+    full_ids = _tensor_to_list(output_ids[0])
+    generated_ids = full_ids[prompt_len:]
+    generated_len = len(generated_ids)
+
+    full_text = tokenizer.decode(full_ids, skip_special_tokens=True)
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    metadata: Dict[str, Any] = {
+        "watermark_type": config.watermark_type,
+        "generation_method": "hf_generate",
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "num_beams": num_beams,
+        "hard": hard,
+        "full_ids": full_ids,
+        "prompt_ids": prompt_ids,
+        "generated_ids": generated_ids,
+        "prompt_len": prompt_len,
+        "generated_len": generated_len,
+    }
+
+    if watermark_processor is not None:
+        metadata.update(watermark_processor.get_metadata())
+
+    return {
+        "full_text": full_text,
+        "generated_text": generated_text,
+        "full_ids": full_ids,
+        "prompt_ids": prompt_ids,
+        "generated_ids": generated_ids,
+        "prompt_len": prompt_len,
+        "generated_len": generated_len,
+        "metadata": metadata,
+    }

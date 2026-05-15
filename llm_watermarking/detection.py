@@ -1,69 +1,85 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 from scipy.stats import norm
 
 from llm_watermarking.config import WatermarkConfig
-from llm_watermarking.watermarking import hash_tokens, partition_vocab
+from llm_watermarking.watermarking import (
+    build_greenlist_ids,
+    ensure_supported_seeding_scheme,
+    hash_tokens,
+)
+
+
+def _flatten_token_ids(full_ids) -> List[int]:
+    if hasattr(full_ids, "detach"):
+        full_ids = full_ids.detach()
+    if hasattr(full_ids, "cpu"):
+        full_ids = full_ids.cpu()
+    if hasattr(full_ids, "tolist"):
+        full_ids = full_ids.tolist()
+
+    if isinstance(full_ids, list) and full_ids and isinstance(full_ids[0], list):
+        if len(full_ids) != 1:
+            raise ValueError("detect_tokens currently expects a single sequence or batch size 1.")
+        full_ids = full_ids[0]
+
+    return [int(token_id) for token_id in full_ids]
 
 
 class WatermarkDetector:
     def __init__(self, tokenizer, config: Optional[WatermarkConfig] = None):
         self.tokenizer = tokenizer
         self.config = config or WatermarkConfig()
+        self.config.seeding_scheme = ensure_supported_seeding_scheme(self.config.seeding_scheme)
 
-    def _get_seed(self, prev_tokens: List[int]) -> int:
-        """Get seed according to the configuration."""
-        window = prev_tokens[-self.config.hash_window :]
-        return hash_tokens(window, key=self.config.private_key or "")
+    def _get_seed(self, prev_tokens: Sequence[int]) -> int:
+        context_tokens = list(prev_tokens[-self.config.hash_window :]) if self.config.hash_window > 0 else []
+        return hash_tokens(context_tokens, key=self.config.private_key or "")
 
-    def detect(
+    def _get_greenlist_ids(self, prev_tokens: Sequence[int]):
+        seed = self._get_seed(prev_tokens)
+        return build_greenlist_ids(
+            self.tokenizer.vocab_size,
+            seed,
+            self.config.gamma,
+            device="cpu",
+        )
+
+    def _detect_from_tokens(
         self,
-        text: str,
+        tokens: Sequence[int],
+        prompt_len: int = 0,
         ignore_repeated_ngrams: bool = True,
-        ngram_size: int = 2,
         return_details: bool = False,
+        repeated_ngram_width: Optional[int] = None,
     ) -> Dict:
-        """
-        Detect watermark in text.
-
-        Args:
-            text: text to be detected
-            ignore_repeated_ngrams: whether to ignore repeated n-grams (Paper Section 4.1)
-            ngram_size: n-gram size
-            return_details: whether to return detailed information
-
-        Returns:
-            Detection result dict
-        """
-        tokens = self.tokenizer(text, return_tensors="pt").input_ids[0].tolist()
-
-        if len(tokens) <= self.config.hash_window:
-            return {
-                "z_score": 0.0,
-                "p_value": 1.0,
-                "prediction": False,
-                "num_tokens": 0,
-                "green_fraction": 0.0,
-            }
+        prompt_len = max(0, min(int(prompt_len), len(tokens)))
+        generated_len = max(0, len(tokens) - prompt_len)
 
         seen_ngrams = set()
         green_count = 0
         total_count = 0
+        ignored_repeated_ngrams = 0
         token_results = []
 
-        for i in range(self.config.hash_window, len(tokens)):
+        repeat_width = self.config.hash_window if repeated_ngram_width is None else max(0, int(repeated_ngram_width))
+
+        for position in range(prompt_len, len(tokens)):
             if ignore_repeated_ngrams:
-                ngram = tuple(tokens[i - ngram_size : i + 1]) if i >= ngram_size else tuple(tokens[: i + 1])
+                start = max(0, position - repeat_width)
+                ngram = tuple(tokens[start : position + 1])
                 if ngram in seen_ngrams:
+                    ignored_repeated_ngrams += 1
                     continue
                 seen_ngrams.add(ngram)
 
-            prev_tokens = tokens[:i]
-            seed = self._get_seed(prev_tokens)
-            green, _ = partition_vocab(self.tokenizer.vocab_size, seed, self.config.gamma)
+            prev_tokens = tokens[:position]
+            green_ids = self._get_greenlist_ids(prev_tokens)
+            green_lookup = set(green_ids.tolist())
 
-            is_green = tokens[i] in green
+            token_id = int(tokens[position])
+            is_green = token_id in green_lookup
             if is_green:
                 green_count += 1
             total_count += 1
@@ -71,9 +87,9 @@ class WatermarkDetector:
             if return_details:
                 token_results.append(
                     {
-                        "position": i,
-                        "token_id": tokens[i],
-                        "token": self.tokenizer.decode([tokens[i]]),
+                        "position": position,
+                        "token_id": token_id,
+                        "token": self.tokenizer.decode([token_id]) if self.tokenizer is not None else None,
                         "is_green": is_green,
                     }
                 )
@@ -84,7 +100,14 @@ class WatermarkDetector:
                 "p_value": 1.0,
                 "prediction": False,
                 "num_tokens": 0,
+                "num_tokens_scored": 0,
+                "num_green_tokens": 0,
                 "green_fraction": 0.0,
+                "expected_green_fraction": self.config.gamma,
+                "prompt_len": prompt_len,
+                "generated_len": generated_len,
+                "ignored_repeated_ngrams": ignored_repeated_ngrams,
+                "token_details": token_results if return_details else None,
             }
 
         expected = self.config.gamma * total_count
@@ -93,19 +116,62 @@ class WatermarkDetector:
         p_value = 1 - norm.cdf(z_score)
 
         result = {
-            "z_score": z_score,
-            "p_value": p_value,
-            "prediction": p_value < 0.01,
+            "z_score": float(z_score),
+            "p_value": float(p_value),
+            "prediction": bool(p_value < 0.01),
             "num_tokens": total_count,
+            "num_tokens_scored": total_count,
             "num_green_tokens": green_count,
             "green_fraction": green_count / total_count,
             "expected_green_fraction": self.config.gamma,
+            "prompt_len": prompt_len,
+            "generated_len": generated_len,
+            "ignored_repeated_ngrams": ignored_repeated_ngrams,
         }
 
         if return_details:
             result["token_details"] = token_results
 
         return result
+
+    def detect_tokens(
+        self,
+        full_ids,
+        prompt_len: int = 0,
+        ignore_repeated_ngrams: bool = True,
+        return_details: bool = False,
+    ) -> Dict:
+        tokens = _flatten_token_ids(full_ids)
+        return self._detect_from_tokens(
+            tokens,
+            prompt_len=prompt_len,
+            ignore_repeated_ngrams=ignore_repeated_ngrams,
+            return_details=return_details,
+            repeated_ngram_width=self.config.hash_window,
+        )
+
+    def detect(
+        self,
+        text: str,
+        ignore_repeated_ngrams: bool = True,
+        ngram_size: int = 2,
+        return_details: bool = False,
+    ) -> Dict:
+        """
+        Compatibility helper for whole-sequence scoring.
+
+        This path tokenizes the entire input text and scores the resulting token
+        sequence from the first token onward. For prompt+completion evaluation the
+        preferred API is ``detect_tokens(full_ids, prompt_len=...)``.
+        """
+        tokens = self.tokenizer(text, return_tensors="pt").input_ids[0].tolist()
+        return self._detect_from_tokens(
+            tokens,
+            prompt_len=0,
+            ignore_repeated_ngrams=ignore_repeated_ngrams,
+            return_details=return_details,
+            repeated_ngram_width=ngram_size,
+        )
 
     def detect_with_multiple_keys(
         self,
@@ -134,7 +200,7 @@ class WatermarkDetector:
 
 
 def detect_watermark(text, tokenizer, gamma=0.5):
-    """Detection function compatible with the original interface."""
+    """Detection helper compatible with the original interface."""
     config = WatermarkConfig(gamma=gamma)
     detector = WatermarkDetector(tokenizer, config)
     result = detector.detect(text)
