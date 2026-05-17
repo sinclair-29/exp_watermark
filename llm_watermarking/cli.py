@@ -57,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top_p", type=float, default=1.0, help="Top-p nucleus sampling threshold")
     parser.add_argument("--top_k", type=int, default=0, help="Top-k sampling threshold")
     parser.add_argument("--num_beams", type=int, default=1, help="Number of beams for HF generation")
+    parser.add_argument("--seed", type=int, default=1234, help="Random seed for generation")
+    parser.add_argument("--debug_tokens", action="store_true", help="Store compact per-token diagnostics in JSON output")
     parser.add_argument(
         "--use_beam_search",
         action="store_true",
@@ -121,6 +123,53 @@ def _append_jsonl(path: str, payload) -> None:
         handle.write(json.dumps(_to_jsonable(payload), sort_keys=True) + "\n")
 
 
+def _set_seed(seed: int) -> None:
+    import random
+
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _compact_token_diagnostics(detection_result, generation_metadata):
+    token_details = detection_result.pop("token_details", None)
+    if token_details is None:
+        return None
+
+    step_metadata = generation_metadata.get("step_metadata") or []
+    diagnostics = []
+    for item in token_details:
+        diagnostic = {
+            "token_index": item.get("token_index"),
+            "token_id": item.get("token_id"),
+            "seed": item.get("seed"),
+            "watermark_vocab_size": item.get("watermark_vocab_size"),
+            "is_green": item.get("is_green"),
+            "cumulative_green_count": item.get("cumulative_green_count"),
+        }
+
+        token_index = item.get("token_index")
+        if isinstance(token_index, int) and 0 <= token_index < len(step_metadata):
+            batch = step_metadata[token_index].get("batch") or []
+            if batch:
+                generation_info = batch[0]
+                if "seed" in generation_info:
+                    diagnostic["generation_seed"] = generation_info["seed"]
+                if "P_G" in generation_info:
+                    diagnostic["P_G"] = generation_info["P_G"]
+                if "r" in generation_info:
+                    diagnostic["r"] = generation_info["r"]
+
+        diagnostics.append(diagnostic)
+
+    return diagnostics
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -180,6 +229,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     print("\nGenerating text...")
+    _set_seed(args.seed)
     generation_result = generate_with_watermark(
         model,
         tokenizer,
@@ -194,12 +244,15 @@ def main():
         num_beams=num_beams,
     )
 
-    detector = WatermarkDetector(tokenizer, config)
+    metadata = generation_result["metadata"]
+    detector = WatermarkDetector(tokenizer, config, watermark_vocab_size=metadata.get("watermark_vocab_size"))
     detection_result = detector.detect_tokens(
         generation_result["full_ids"],
         prompt_len=generation_result["prompt_len"],
         ignore_repeated_ngrams=args.ignore_repeated_ngrams,
+        return_details=args.debug_tokens,
     )
+    token_diagnostics = _compact_token_diagnostics(detection_result, metadata) if args.debug_tokens else None
 
     ppl_result = None
     if args.compute_ppl:
@@ -246,7 +299,6 @@ def main():
     else:
         print(f"\n[X] Watermark detection result: z <= {args.detection_threshold}")
 
-    metadata = generation_result["metadata"]
     if config.watermark_type == "opt":
         print(
             f"\nOPT statistics: applied={metadata.get('opt_applied_tokens', 0)}/"
@@ -310,12 +362,15 @@ def main():
 
     output_payload = {
         "prompt": args.prompt,
+        "seed": args.seed,
         "config": vars(args),
         "generation": generation_result,
         "detection": detection_result,
         "ppl": ppl_result,
         "attack": attack_result,
     }
+    if token_diagnostics is not None:
+        output_payload["token_diagnostics"] = token_diagnostics
 
     if args.output_json:
         _write_json(args.output_json, output_payload)

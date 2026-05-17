@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--no_sample", action="store_true", help="Disable sampling")
+    parser.add_argument("--seed", type=int, default=1234, help="Base random seed for deterministic per-run generation")
+    parser.add_argument("--debug_tokens", action="store_true", help="Store compact per-token diagnostics in raw JSON")
     parser.add_argument("--force", action="store_true", help="Overwrite existing raw JSON files")
     return parser
 
@@ -185,6 +187,60 @@ def get_model_device(model):
     return None
 
 
+def derive_run_seed(base_seed: int, model_name: str, prompt_index: int, method_key: str) -> int:
+    model_index = list(MODEL_PATHS.keys()).index(model_name)
+    method_index = METHOD_KEYS.index(method_key)
+    seed = int(base_seed) + model_index * 1_000_003 + int(prompt_index) * 10_007 + method_index * 101
+    return seed % (2**32)
+
+
+def set_seed(seed: int) -> None:
+    import random
+
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def compact_token_diagnostics(detection_result: dict, generation_metadata: dict):
+    token_details = detection_result.pop("token_details", None)
+    if token_details is None:
+        return None
+
+    step_metadata = generation_metadata.get("step_metadata") or []
+    diagnostics = []
+    for item in token_details:
+        diagnostic = {
+            "token_index": item.get("token_index"),
+            "token_id": item.get("token_id"),
+            "seed": item.get("seed"),
+            "watermark_vocab_size": item.get("watermark_vocab_size"),
+            "is_green": item.get("is_green"),
+            "cumulative_green_count": item.get("cumulative_green_count"),
+        }
+
+        token_index = item.get("token_index")
+        if isinstance(token_index, int) and 0 <= token_index < len(step_metadata):
+            batch = step_metadata[token_index].get("batch") or []
+            if batch:
+                generation_info = batch[0]
+                if "seed" in generation_info:
+                    diagnostic["generation_seed"] = generation_info["seed"]
+                if "P_G" in generation_info:
+                    diagnostic["P_G"] = generation_info["P_G"]
+                if "r" in generation_info:
+                    diagnostic["r"] = generation_info["r"]
+
+        diagnostics.append(diagnostic)
+
+    return diagnostics
+
+
 def run_for_model(
     model_name: str,
     model_path: str,
@@ -213,7 +269,7 @@ def run_for_model(
         tokenizer.pad_token = tokenizer.eos_token
 
     try:
-        for _, prompt_id, prompt in prompts:
+        for prompt_index, prompt_id, prompt in prompts:
             print(f"Prompt {prompt_id}")
             for method_key in selected_methods:
                 output_json = RAW_DIR / model_name / method_key / f"{prompt_id}.json"
@@ -221,8 +277,10 @@ def run_for_model(
                     print(f"Skipping existing result: {output_json}")
                     continue
 
-                print(f"  Method {method_key} -> {output_json}")
+                run_seed = derive_run_seed(args.seed, model_name, prompt_index, method_key)
+                print(f"  Method {method_key} seed={run_seed} -> {output_json}")
                 config = build_config(method_key)
+                set_seed(run_seed)
                 generation_result = generate_with_watermark(
                     model,
                     tokenizer,
@@ -237,11 +295,16 @@ def run_for_model(
                     num_beams=args.num_beams,
                 )
 
-                detector = WatermarkDetector(tokenizer, config)
+                metadata = generation_result["metadata"]
+                detector = WatermarkDetector(tokenizer, config, watermark_vocab_size=metadata.get("watermark_vocab_size"))
                 detection_result = detector.detect_tokens(
                     generation_result["full_ids"],
                     prompt_len=generation_result["prompt_len"],
                     ignore_repeated_ngrams=False,
+                    return_details=args.debug_tokens,
+                )
+                token_diagnostics = (
+                    compact_token_diagnostics(detection_result, metadata) if args.debug_tokens else None
                 )
 
                 model_device = get_model_device(model)
@@ -264,11 +327,14 @@ def run_for_model(
                     "model_name": model_name,
                     "model_path": model_path,
                     "method_key": method_key,
+                    "seed": run_seed,
                     "config": vars(config),
                     "generation": generation_result,
                     "detection": detection_result,
                     "ppl": ppl_result,
                 }
+                if token_diagnostics is not None:
+                    payload["token_diagnostics"] = token_diagnostics
                 write_json(output_json, payload)
     finally:
         del model

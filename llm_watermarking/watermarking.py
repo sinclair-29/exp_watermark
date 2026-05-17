@@ -235,6 +235,7 @@ class WatermarkLogitsProcessor(LogitsProcessor):
 
     def reset_metadata(self) -> None:
         self.step_metadata: List[Dict[str, object]] = []
+        self.watermark_vocab_size: int = int(getattr(self, "_runtime_vocab_size", self.vocab_size))
         self.greenlist_sizes: List[int] = []
         self.spike_entropies: List[float] = []
         self.opt_B_values: List[float] = []
@@ -279,12 +280,15 @@ class WatermarkLogitsProcessor(LogitsProcessor):
         import torch
 
         self._runtime_vocab_size = int(runtime_vocab_size or logits.shape[-1])
+        self.watermark_vocab_size = self._runtime_vocab_size
         seed = self._get_seed(prev_tokens)
         green_ids, green_mask = self._get_greenlist_ids_and_mask(seed, logits.device)
         del green_ids
 
         info: Dict[str, object] = {
             "watermark_type": self.config.watermark_type,
+            "seed": int(seed),
+            "watermark_vocab_size": self.watermark_vocab_size,
             "greenlist_size": int(green_mask.sum().item()),
             "applied": False,
             "spike_entropy": None,
@@ -410,6 +414,7 @@ class WatermarkLogitsProcessor(LogitsProcessor):
     def get_metadata(self) -> Dict[str, object]:
         metadata: Dict[str, object] = {
             "watermark_type": self.config.watermark_type,
+            "watermark_vocab_size": int(self.watermark_vocab_size),
             "num_steps": len(self.step_metadata),
             "greenlist_sizes": list(self.greenlist_sizes),
             "avg_greenlist_size": float(np.mean(self.greenlist_sizes)) if self.greenlist_sizes else None,

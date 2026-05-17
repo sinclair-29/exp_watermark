@@ -81,8 +81,9 @@ def scan_raw_results(
     raw_dir: Path,
     selected_models: set[str] | None = None,
     selected_methods: set[str] | None = None,
-) -> Dict[Tuple[str, str], Dict[str, List[float]]]:
+) -> Tuple[Dict[Tuple[str, str], Dict[str, List[float]]], List[str]]:
     grouped: Dict[Tuple[str, str], Dict[str, List[float]]] = defaultdict(lambda: {"z_scores": [], "ppls": []})
+    warnings: List[str] = []
 
     for path in sorted(raw_dir.glob("*/*/*.json")):
         model_name = path.parts[-3]
@@ -96,14 +97,30 @@ def scan_raw_results(
             payload = json.load(handle)
 
         z_score = payload["detection"]["z_score"]
-        ppl_payload = payload.get("ppl") or {}
-        ppl = ppl_payload.get("ppl")
-
         grouped[(model_name, method_key)]["z_scores"].append(float(z_score))
-        if ppl is not None and math.isfinite(float(ppl)):
-            grouped[(model_name, method_key)]["ppls"].append(float(ppl))
 
-    return grouped
+        ppl_payload = payload.get("ppl")
+        ppl = ppl_payload.get("ppl") if isinstance(ppl_payload, dict) else None
+        if ppl is None:
+            warnings.append(f"Missing PPL: {path}")
+            continue
+
+        try:
+            ppl_value = float(ppl)
+        except (TypeError, ValueError):
+            warnings.append(f"Missing PPL: {path}")
+            continue
+
+        if not math.isfinite(ppl_value):
+            warnings.append(f"Missing PPL: {path}")
+            continue
+        if ppl_value < 1.0:
+            warnings.append(f"Invalid finite PPL < 1: {path} (ppl={ppl_value:.6g})")
+            continue
+
+        grouped[(model_name, method_key)]["ppls"].append(ppl_value)
+
+    return grouped, warnings
 
 
 def build_rows(
@@ -129,8 +146,8 @@ def build_rows(
                 "Variant": VARIANT_NAMES[method_key],
                 "Avg. z-score": mean_or_nan(z_scores),
                 "Std. z-score": std_or_nan(z_scores),
-                "Avg. PPL": mean_or_nan(ppls),
-                "Std. PPL": std_or_nan(ppls),
+                "Avg. Self-PPL": mean_or_nan(ppls),
+                "Std. Self-PPL": std_or_nan(ppls),
                 "Num Runs": len(z_scores),
             }
         )
@@ -154,8 +171,8 @@ def write_csv(rows: Iterable[Dict[str, object]], output_path: Path) -> None:
                 "Variant",
                 "Avg. z-score",
                 "Std. z-score",
-                "Avg. PPL",
-                "Std. PPL",
+                "Avg. Self-PPL",
+                "Std. Self-PPL",
                 "Num Runs",
             ],
         )
@@ -168,8 +185,8 @@ def write_csv(rows: Iterable[Dict[str, object]], output_path: Path) -> None:
                     "Variant": row["Variant"],
                     "Avg. z-score": format_float(float(row["Avg. z-score"]), 6),
                     "Std. z-score": format_float(float(row["Std. z-score"]), 6),
-                    "Avg. PPL": format_float(float(row["Avg. PPL"]), 6),
-                    "Std. PPL": format_float(float(row["Std. PPL"]), 6),
+                    "Avg. Self-PPL": format_float(float(row["Avg. Self-PPL"]), 6),
+                    "Std. Self-PPL": format_float(float(row["Std. Self-PPL"]), 6),
                     "Num Runs": row["Num Runs"],
                 }
             )
@@ -178,16 +195,31 @@ def write_csv(rows: Iterable[Dict[str, object]], output_path: Path) -> None:
 def write_markdown(rows: Iterable[Dict[str, object]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w") as handle:
-        handle.write("| Model | Method | Variant | Avg. z-score | Std. z-score | Avg. PPL | Std. PPL |\n")
-        handle.write("| --- | --- | --- | ---: | ---: | ---: | ---: |\n")
+        handle.write(
+            "| Model | Method | Variant | Avg. z-score | Std. z-score | "
+            "Avg. Self-PPL | Std. Self-PPL | Num Runs |\n"
+        )
+        handle.write("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |\n")
         for row in rows:
             handle.write(
                 f"| {row['Model']} | {row['Method']} | {row['Variant']} | "
                 f"{format_float(float(row['Avg. z-score']), 4)} | "
                 f"{format_float(float(row['Std. z-score']), 4)} | "
-                f"{format_float(float(row['Avg. PPL']), 4)} | "
-                f"{format_float(float(row['Std. PPL']), 4)} |\n"
+                f"{format_float(float(row['Avg. Self-PPL']), 4)} | "
+                f"{format_float(float(row['Std. Self-PPL']), 4)} | "
+                f"{row['Num Runs']} |\n"
             )
+
+
+def build_summary_warnings(rows: Iterable[Dict[str, object]]) -> List[str]:
+    warnings = []
+    for row in rows:
+        num_runs = int(row["Num Runs"])
+        if num_runs < 20:
+            warnings.append(
+                f"Num Runs < 20: {row['Model']} / {row['Method']} / {row['Variant']} has {num_runs} run(s)"
+            )
+    return warnings
 
 
 def main() -> None:
@@ -200,14 +232,19 @@ def main() -> None:
     selected_model_set = set(selected_models) if selected_models is not None else None
     selected_method_set = set(selected_methods) if selected_methods is not None else None
 
-    grouped = scan_raw_results(raw_dir, selected_model_set, selected_method_set)
+    grouped, warnings = scan_raw_results(raw_dir, selected_model_set, selected_method_set)
     rows = build_rows(grouped, selected_model_set, selected_method_set)
+    warnings.extend(build_summary_warnings(rows))
 
     write_csv(rows, summary_csv)
     write_markdown(rows, summary_md)
 
     print(f"Wrote {summary_csv}")
     print(f"Wrote {summary_md}")
+    if warnings:
+        print("\nWarnings:")
+        for warning in warnings:
+            print(f"- {warning}")
 
 
 if __name__ == "__main__":

@@ -51,6 +51,22 @@ def _tensor_to_list(tokens):
     return list(tokens)
 
 
+def _safe_int(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_tokenizer_len(tokenizer):
+    try:
+        return int(len(tokenizer))
+    except (TypeError, AttributeError):
+        return None
+
+
 class WatermarkBeamSearcher:
     """
     Thin compatibility wrapper over the main HF generation path.
@@ -110,16 +126,21 @@ def generate_with_watermark(
     prompt_ids = _tensor_to_list(input_ids[0])
     prompt_len = len(prompt_ids)
 
+    model_config = getattr(model, "config", None)
+    model_config_vocab_size = _safe_int(getattr(model_config, "vocab_size", None))
+    model_vocab_size = model_config_vocab_size
+    if model_vocab_size is None:
+        model_vocab_size = _safe_int(getattr(model, "vocab_size", None))
+    tokenizer_vocab_size = _safe_int(getattr(tokenizer, "vocab_size", None))
+    tokenizer_len = _safe_tokenizer_len(tokenizer)
+    fallback_vocab_size = model_vocab_size or tokenizer_vocab_size or tokenizer_len
+
     logits_processor = None
     watermark_processor = None
     if config.watermark_type.lower() != "none":
-        model_config = getattr(model, "config", None)
-        model_vocab_size = getattr(model_config, "vocab_size", None)
-        if model_vocab_size is None:
-            model_vocab_size = getattr(model, "vocab_size", None)
-        if model_vocab_size is None:
-            model_vocab_size = tokenizer.vocab_size
-        watermark_processor = WatermarkLogitsProcessor(config, int(model_vocab_size), hard=hard)
+        if fallback_vocab_size is None:
+            raise ValueError("Unable to infer a vocabulary size for watermarking.")
+        watermark_processor = WatermarkLogitsProcessor(config, int(fallback_vocab_size), hard=hard)
         logits_processor = LogitsProcessorList([watermark_processor])
 
     generate_kwargs: Dict[str, Any] = {
@@ -151,6 +172,10 @@ def generate_with_watermark(
 
     metadata: Dict[str, Any] = {
         "watermark_type": config.watermark_type,
+        "model_config_vocab_size": model_config_vocab_size,
+        "tokenizer_vocab_size": tokenizer_vocab_size,
+        "tokenizer_len": tokenizer_len,
+        "watermark_vocab_size": fallback_vocab_size,
         "generation_method": "hf_generate",
         "do_sample": do_sample,
         "temperature": temperature,

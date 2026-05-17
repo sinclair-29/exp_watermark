@@ -1,3 +1,4 @@
+import warnings
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -28,19 +29,35 @@ def _flatten_token_ids(full_ids) -> List[int]:
 
 
 class WatermarkDetector:
-    def __init__(self, tokenizer, config: Optional[WatermarkConfig] = None):
+    def __init__(
+        self,
+        tokenizer,
+        config: Optional[WatermarkConfig] = None,
+        watermark_vocab_size: Optional[int] = None,
+    ):
         self.tokenizer = tokenizer
         self.config = config or WatermarkConfig()
         self.config.seeding_scheme = ensure_supported_seeding_scheme(self.config.seeding_scheme)
+        self.watermark_vocab_size = int(watermark_vocab_size) if watermark_vocab_size is not None else None
 
     def _get_seed(self, prev_tokens: Sequence[int]) -> int:
         context_tokens = list(prev_tokens[-self.config.hash_window :]) if self.config.hash_window > 0 else []
         return hash_tokens(context_tokens, key=self.config.private_key or "")
 
+    def _get_watermark_vocab_size(self) -> int:
+        if self.watermark_vocab_size is not None:
+            return self.watermark_vocab_size
+        if self.tokenizer is None or not hasattr(self.tokenizer, "vocab_size"):
+            raise ValueError("watermark_vocab_size is required when tokenizer.vocab_size is unavailable.")
+        return int(self.tokenizer.vocab_size)
+
     def _get_greenlist_ids(self, prev_tokens: Sequence[int]):
         seed = self._get_seed(prev_tokens)
+        return self._build_greenlist_ids(seed)
+
+    def _build_greenlist_ids(self, seed: int):
         return build_greenlist_ids(
-            self.tokenizer.vocab_size,
+            self._get_watermark_vocab_size(),
             seed,
             self.config.gamma,
             device="cpu",
@@ -75,7 +92,9 @@ class WatermarkDetector:
                 seen_ngrams.add(ngram)
 
             prev_tokens = tokens[:position]
-            green_ids = self._get_greenlist_ids(prev_tokens)
+            seed = self._get_seed(prev_tokens)
+            watermark_vocab_size = self._get_watermark_vocab_size()
+            green_ids = self._build_greenlist_ids(seed)
             green_lookup = set(green_ids.tolist())
 
             token_id = int(tokens[position])
@@ -88,9 +107,15 @@ class WatermarkDetector:
                 token_results.append(
                     {
                         "position": position,
+                        "token_index": position - prompt_len,
+                        "absolute_token_position": position,
                         "token_id": token_id,
                         "token": self.tokenizer.decode([token_id]) if self.tokenizer is not None else None,
+                        "seed": int(seed),
+                        "watermark_vocab_size": watermark_vocab_size,
                         "is_green": is_green,
+                        "cumulative_green_count": green_count,
+                        "cumulative_scored_token_count": total_count,
                     }
                 )
 
@@ -106,6 +131,7 @@ class WatermarkDetector:
                 "expected_green_fraction": self.config.gamma,
                 "prompt_len": prompt_len,
                 "generated_len": generated_len,
+                "watermark_vocab_size": self._get_watermark_vocab_size(),
                 "ignored_repeated_ngrams": ignored_repeated_ngrams,
                 "token_details": token_results if return_details else None,
             }
@@ -126,6 +152,7 @@ class WatermarkDetector:
             "expected_green_fraction": self.config.gamma,
             "prompt_len": prompt_len,
             "generated_len": generated_len,
+            "watermark_vocab_size": self._get_watermark_vocab_size(),
             "ignored_repeated_ngrams": ignored_repeated_ngrams,
         }
 
@@ -158,12 +185,34 @@ class WatermarkDetector:
         return_details: bool = False,
     ) -> Dict:
         """
-        Compatibility helper for whole-sequence scoring.
+        Legacy compatibility helper for whole-sequence scoring.
 
         This path tokenizes the entire input text and scores the resulting token
-        sequence from the first token onward. For prompt+completion evaluation the
-        preferred API is ``detect_tokens(full_ids, prompt_len=...)``.
+        sequence from the first token onward, so prompt tokens may be included in
+        the score. For prompt+completion evaluation the preferred API is
+        ``detect_tokens(full_ids, prompt_len=...)``.
         """
+        warnings.warn(
+            "WatermarkDetector.detect(text) scores the whole tokenized text. "
+            "Use detect_tokens(full_ids, prompt_len=...) for prompt+completion evaluation.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return self.detect_full_text_legacy(
+            text,
+            ignore_repeated_ngrams=ignore_repeated_ngrams,
+            ngram_size=ngram_size,
+            return_details=return_details,
+        )
+
+    def detect_full_text_legacy(
+        self,
+        text: str,
+        ignore_repeated_ngrams: bool = True,
+        ngram_size: int = 2,
+        return_details: bool = False,
+    ) -> Dict:
+        """Tokenize and score the entire text. Prefer detect_tokens for experiments."""
         tokens = self.tokenizer(text, return_tensors="pt").input_ids[0].tolist()
         return self._detect_from_tokens(
             tokens,
